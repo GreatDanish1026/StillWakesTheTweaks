@@ -187,3 +187,10 @@ Stutter monitor, first 6-minute session (typical frame 10-16 ms):
 
 Post-processing extras (bloom resolution/off, lens flares off, vignette off) work live, as
 expected: they're read on the game thread each frame.
+
+Also tried and removed (0.0.8): glossy reflections (`r.Lumen.Reflections.MaxRoughnessToTrace`
+0.6 / 0.8), traced glass and water reflections (`r.Lumen.TranslucencyReflections.FrontLayer.Enable`,
+which only affects materials authored for front-layer translucency) and tonemapper sharpening
+(`r.Tonemapper.Sharpen` up to 1.0). All three applied live with no errors, and none was visible
+in game. Full-resolution skin wasn't added: Epic effects already set `r.SSS.HalfRes=0` and
+`r.SSS.Quality=1`.

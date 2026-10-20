@@ -5,6 +5,6 @@
 #define SWTK_PRODUCT "StillWakesTweaks"  // the HDR add-on: name, log file, ReShade.ini section
 #define SWTD_GAME "Still Wakes the Deep"
 #define SWTD_VERSION_MAJOR 0
-#define SWTD_VERSION_MINOR 0
-#define SWTD_VERSION_PATCH 7
-#define SWTD_VERSION "0.0.7"
+#define SWTD_VERSION_MINOR 1
+#define SWTD_VERSION_PATCH 0
+#define SWTD_VERSION "0.1.0"

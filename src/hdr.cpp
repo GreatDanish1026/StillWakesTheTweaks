@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -661,7 +662,7 @@ void InitEngineIni() {
     // ReShade.ini changed); the engine has already read it, so this applies at the next start.
     if (const Preset* p = FindPreset(g_presetAtLoad)) {
         std::string want = ComposeIni(*p), have = g_startupText;
-        have.erase(std::remove(have.begin(), have.end(), ''), have.end());
+        have.erase(std::remove(have.begin(), have.end(), '\r'), have.end());
         if (want != have) WritePreset(*p);
     }
     if (g_presetAtLoad == "-" && WritePreset(kPresets[0]))
@@ -841,41 +842,66 @@ void LiveOnPresent() {
     KeepLiveValues();
 }
 
-void DrawPresetSection() {
-    ImGui::SeparatorText("Lighting quality");
+// ---------------------------------------------------------------- overlay helpers
+
+constexpr ImVec4 kGood(0.45f, 0.85f, 0.45f, 1.0f);
+constexpr ImVec4 kWarn(1.0f, 0.8f, 0.3f, 1.0f);
+constexpr ImVec4 kBad(1.0f, 0.45f, 0.35f, 1.0f);
+constexpr ImVec4 kAccent(0.4f, 0.75f, 1.0f, 1.0f);
+
+float ControlWidth() { return ImGui::GetFontSize() * 15.0f; }
+
+// A dimmed (?) after the last item, with <text> on hover.
+void Help(const char* text) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
+}
+
+// A small dot before a control whose value differs from the game's, so changes stand out.
+void ChangedMark(bool changed) {
+    if (changed)
+        ImGui::TextColored(kAccent, "*");
+    else
+        ImGui::TextUnformatted(" ");
+    ImGui::SameLine();
+}
+
+// ---------------------------------------------------------------- graphics section
+
+// The lighting preset combo; true when a new preset was picked.
+void DrawPresetCombo() {
     int current = -1;
     for (int i = 0; i < static_cast<int>(std::size(kPresets)); ++i)
         if (g_presetNow == kPresets[i].id) current = i;
     const char* preview = current >= 0 ? kPresets[current].label : g_presetNow.empty() ? "Your own Engine.ini" : "Not set";
-    const bool live = g_live.load() == Live::Ready;
-    if (ImGui::BeginCombo(live ? "Preset" : "Preset (applies after a restart)", preview)) {
+    ChangedMark(current > 0 || g_presetNow.empty());
+    ImGui::SetNextItemWidth(ControlWidth());
+    if (ImGui::BeginCombo("Lighting quality", preview)) {
         for (int i = 0; i < static_cast<int>(std::size(kPresets)); ++i)
-            if (ImGui::Selectable(kPresets[i].label, i == current) && i != current && WritePreset(kPresets[i]))
+            if (ImGui::Selectable(kPresets[i].label, i == current) && i != current && WritePreset(kPresets[i])) {
                 g_pendingLive = &kPresets[i];  // applied live by the next present, if possible
+                Log("preset: %s", kPresets[i].id);
+            }
         ImGui::EndCombo();
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Global illumination, reflections, shadows and fog beyond the game's menu.\n"
-                          "Written to Engine.ini, which overrides the menu's lighting settings.");
+    Help("Global illumination, reflections, shadows and fog beyond the game's menu.\n"
+         "Epic-plus: true Epic GI and shadows plus full-resolution reflections (about 16% slower).\n"
+         "Cinematic: UE's highest tier (about 60% slower).\n"
+         "These override the menu's lighting settings.");
     if (g_presetNow.empty())
         ImGui::TextWrapped("Your Engine.ini isn't one of ours. Choosing a preset replaces it; a copy is kept as "
                            "Engine.ini.before-StillWakesTweaks.");
-    else if (live && !g_liveMessage.empty())
-        ImGui::TextDisabled("%s", g_liveMessage.c_str());
-    else if (!live && g_presetNow != g_presetAtLoad)
-        ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "Restart the game to apply.");
-    if (!live && !g_iniMessage.empty()) ImGui::TextWrapped("%s", g_iniMessage.c_str());
-    if (g_live.load() == Live::Failed)
-        ImGui::TextDisabled("Live changes unavailable (see StillWakesTweaks.log); presets apply after a restart.");
 }
 
-// The extras, one combo each under their section headings.
-void DrawExtrasSection() {
+// The extras of one overlay section; true if one changed.
+bool DrawExtras(const char* section) {
     bool changed = false;
-    const char* section = nullptr;
     for (Extra& e : g_extras) {
-        if (!section || strcmp(section, e.section)) ImGui::SeparatorText(section = e.section);
+        if (strcmp(e.section, section)) continue;
         const ExtraOption* cur = Chosen(e);
+        ChangedMark(e.value != 0);
+        ImGui::SetNextItemWidth(ControlWidth());
         if (ImGui::BeginCombo(e.label, cur ? cur->label : "?")) {
             for (const ExtraOption& o : e.options)
                 if (ImGui::Selectable(o.label, o.id == e.value) && o.id != e.value) {
@@ -885,8 +911,44 @@ void DrawExtrasSection() {
                 }
             ImGui::EndCombo();
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.tip);
+        Help(e.tip);
     }
+    return changed;
+}
+
+void DrawGraphics() {
+    bool changed = false;
+    ImGui::SeparatorText("Lighting");
+    DrawPresetCombo();
+    changed |= DrawExtras("Lighting");
+    ImGui::SeparatorText("Textures and fog");
+    changed |= DrawExtras("Textures and fog");
+    ImGui::SeparatorText("Post-processing");
+    changed |= DrawExtras("Post-processing");
+
+    ImGui::Spacing();
+    bool anyExtra = false;
+    for (const Extra& e : g_extras) anyExtra |= e.value != 0;
+    ImGui::BeginDisabled(!anyExtra);
+    if (ImGui::Button("Set all to Game")) {
+        for (Extra& e : g_extras) e.value = 0;
+        changed = true;
+        Log("extras: all set to Game");
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Every option above except Lighting quality back to the game's value.");
+
+    const Live live = g_live.load();
+    ImGui::SameLine();
+    if (live == Live::Ready)
+        ImGui::TextDisabled("%s", g_liveMessage.empty() ? "Changes apply at once." : g_liveMessage.c_str());
+    else if (live == Live::Failed)
+        ImGui::TextColored(kWarn, "Changes apply after a restart (see StillWakesTweaks.log).");
+    else
+        ImGui::TextDisabled("Connecting to the game's settings...");
+    if (live != Live::Ready && !g_iniMessage.empty()) ImGui::TextWrapped("%s", g_iniMessage.c_str());
+
     if (!changed) return;
     SaveExtras();
     const Preset* p = FindPreset(g_presetNow);
@@ -969,18 +1031,24 @@ void MonitorOnPresent(bool focused) {
 }
 
 void DrawMonitorSection() {
-    ImGui::SeparatorText("Stutter monitor");
     const HitchStats& s = g_sinceReset;
     if (g_medianMs > 0)
-        ImGui::Text("Frame time: typical %.1f ms (%.0f fps), 99th percentile %.1f ms", g_medianMs, 1000.0 / g_medianMs,
+        ImGui::Text("Frame time  %.1f ms typical (%.0f fps), %.1f ms 99th percentile", g_medianMs, 1000.0 / g_medianMs,
                     g_p99Ms);
-    ImGui::Text("Hitches: %llu (%llu over 100 ms), %llu from shader compiles; worst frame %.0f ms", s.hitches, s.severe,
-                s.shader, s.worstMs);
+    else
+        ImGui::TextDisabled("Measuring...");
+    ImGui::Text("Hitches     %llu", s.hitches);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%llu over 100 ms, %llu from shader compiles; worst frame %.0f ms)", s.severe, s.shader,
+                        s.worstMs);
     ImGui::TextDisabled("Pipelines compiled: %llu, %llu of them 10 ms or more", g_pipesTotal.load(), g_pipesSlow.load());
     if (ImGui::Button("Reset counts")) {
         g_sinceReset = {};
         Log("stutter monitor reset");
     }
+    Help("A hitch is a frame taking 2.5x the typical frame time and at least 25 ms, while the game\n"
+         "has focus. Shader compiles happen the first time something is drawn; the driver keeps them,\n"
+         "so they don't repeat. Each hitch is listed in StillWakesTweaks.log next to the game's exe.");
 }
 
 bool g_firstPresent = false;
@@ -1023,36 +1091,100 @@ void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t
     }
 }
 
-void DrawOverlay(effect_runtime* rt) {
-    if (!g_loaded) LoadSettings(rt);
-    ImGui::SeparatorText("HDR");
+void DrawHdr(effect_runtime* rt) {
     bool changed = false;
-    changed |= ImGui::Checkbox("HDR fix (F8 toggles in game)", &g_hdr.enable);
-    changed |= ImGui::SliderFloat("Paper white (nits)", &g_hdr.paperWhite, 80.0f, 400.0f, "%.0f");
+    if (g_lastColorSpace == color_space::srgb)
+        ImGui::TextColored(kWarn, "The game is in SDR. Turn on HDR in its display settings to use the fix.");
+
+    changed |= ImGui::Checkbox("HDR fix", &g_hdr.enable);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(F8 toggles in game)");
+    ImGui::BeginDisabled(!g_hdr.enable);
+
+    auto slider = [&](const char* label, float* v, float lo, float hi, const char* fmt, float def, const char* help) {
+        ChangedMark(fabsf(*v - def) > 1e-3f);
+        ImGui::SetNextItemWidth(ControlWidth());
+        changed |= ImGui::SliderFloat(label, v, lo, hi, fmt);
+        Help(help);
+    };
+    const HdrSettings def;
+    slider("Paper white", &g_hdr.paperWhite, 80.0f, 400.0f, "%.0f nits", def.paperWhite,
+           "Brightness of SDR white (menus, signs, lit walls). It sets the overall brightness of\n"
+           "everything that isn't a highlight. 203 nits is the HDR reference level.");
+
     bool useGamePeak = g_hdr.peak <= 0;
+    ChangedMark(!useGamePeak);
     if (ImGui::Checkbox("Peak from the game's HDR brightness", &useGamePeak)) {
         g_hdr.peak = useGamePeak ? 0.0f : 1000.0f;
         changed = true;
     }
-    if (!useGamePeak) changed |= ImGui::SliderFloat("Peak (nits)", &g_hdr.peak, 400.0f, 10000.0f, "%.0f");
-    changed |= ImGui::SliderFloat("Black floor (0 = sRGB, 1 = gamma 2.2)", &g_hdr.blackFloor, 0.0f, 1.0f, "%.2f");
-    changed |= ImGui::SliderFloat("Highlight saturation", &g_hdr.highlightSat, 0.0f, 1.0f, "%.2f");
-    changed |= ImGui::SliderFloat("Highlight knee (SDR level)", &g_hdr.knee, 0.2f, 0.9f, "%.2f");
-    if (ImGui::Button("Defaults")) {
+    Help("Use the game's HDR Content Brightness setting as the brightest highlight. Set it\n"
+         "to your display's peak brightness.");
+    if (!useGamePeak)
+        slider("Peak", &g_hdr.peak, 400.0f, 10000.0f, "%.0f nits", 1000.0f,
+               "Brightest highlight the fix will output.");
+    slider("Black floor", &g_hdr.blackFloor, 0.0f, 1.0f, "%.2f", def.blackFloor,
+           "Shadow depth. 1 shows shadows as the SDR image looks on a gamma 2.2 display\n"
+           "(deep blacks); 0 keeps the stock sRGB shadows (raised blacks).");
+    slider("Highlight colour", &g_hdr.highlightSat, 0.0f, 1.0f, "%.2f", def.highlightSat,
+           "How much colour bright lights keep. 0 rolls coloured lights toward white as in SDR;\n"
+           "1 keeps the full colour (close to the stock HDR look).");
+    slider("Highlight start", &g_hdr.knee, 0.2f, 0.9f, "%.2f", def.knee,
+           "SDR level where highlights start to extend toward the peak. Lower = more of the\n"
+           "image gets brighter.");
+    ImGui::EndDisabled();
+
+    if (ImGui::Button("Reset HDR")) {
         g_hdr = HdrSettings{};
         changed = true;
     }
+    if (!g_lutReplaced.load()) {
+        ImGui::SameLine();
+        ImGui::TextColored(kBad, "Not active yet: the game's colour pass wasn't found (see the log).");
+    }
     if (changed) SaveSettings(rt);
+}
 
-    if (g_lutReplaced.load())
-        ImGui::TextDisabled("LUT shader replaced; root signatures extended %u of %u; %u settings pushes",
-                            g_layoutsExtended.load(), g_layoutsSeen.load(), g_pushes.load());
+void DrawDiagnostics() {
+    ImGui::TextDisabled("Colour pass: %s; root signatures extended %u of %u; %u settings pushes",
+                        g_lutReplaced.load() ? "replaced" : "not found", g_layoutsExtended.load(), g_layoutsSeen.load(),
+                        g_pushes.load());
+    const Live live = g_live.load();
+    ImGui::TextDisabled("Game settings: %s; sinks %s", live == Live::Ready    ? "connected"
+                                                       : live == Live::Failed ? "unavailable"
+                                                                              : "connecting",
+                        g_sinkConfirmed ? "confirmed" : g_sinkFlag >= 0 ? "found" : "not found");
+    ImGui::TextDisabled("Engine.ini at start: %s; now: %s",
+                        g_presetAtLoad == "-" ? "none" : g_presetAtLoad.empty() ? "your own" : g_presetAtLoad.c_str(),
+                        g_presetNow == "-" ? "none" : g_presetNow.empty() ? "your own" : g_presetNow.c_str());
+    ImGui::TextDisabled("Log: StillWakesTweaks.log next to the game's exe");
+}
+
+void DrawOverlay(effect_runtime* rt) {
+    if (!g_loaded) LoadSettings(rt);
+
+    ImGui::TextDisabled(SWTK_PRODUCT " " SWTD_VERSION);
+    ImGui::SameLine();
+    if (g_lastColorSpace != color_space::hdr10_pq)
+        ImGui::TextColored(kWarn, "  HDR fix: needs HDR output");
+    else if (!g_lutReplaced.load())
+        ImGui::TextColored(kBad, "  HDR fix: not active");
+    else if (g_hdr.enable)
+        ImGui::TextColored(kGood, "  HDR fix: on");
     else
-        ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "LUT shader not replaced yet (see StillWakesTweaks.log)");
+        ImGui::TextColored(kWarn, "  HDR fix: off (F8)");
+    ImGui::SameLine();
+    const Live live = g_live.load();
+    if (live == Live::Ready)
+        ImGui::TextColored(kGood, "   Settings: live");
+    else if (live == Live::Failed)
+        ImGui::TextColored(kWarn, "   Settings: after restart");
+    ImGui::TextDisabled("* = changed from the game's value. Hover (?) for details.");
 
-    DrawPresetSection();
-    DrawExtrasSection();
-    DrawMonitorSection();
+    if (ImGui::CollapsingHeader("HDR", ImGuiTreeNodeFlags_DefaultOpen)) DrawHdr(rt);
+    if (ImGui::CollapsingHeader("Graphics", ImGuiTreeNodeFlags_DefaultOpen)) DrawGraphics();
+    if (ImGui::CollapsingHeader("Performance")) DrawMonitorSection();
+    if (ImGui::CollapsingHeader("Diagnostics")) DrawDiagnostics();
 }
 
 }  // namespace
