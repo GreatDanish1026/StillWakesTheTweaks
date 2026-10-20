@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -44,6 +45,7 @@
 #include <vector>
 
 #include "lutbuilder_skiptemp.h"
+#include "presets.h"
 #include "version.h"
 
 extern "C" __declspec(dllexport) const char* NAME = SWTK_PRODUCT;
@@ -261,9 +263,36 @@ bool IsExtended(uint64_t layout) {
     return g_extendedLayouts.count(layout) != 0;
 }
 
+// ---------------------------------------------------------------- ray tracing activity
+//
+// Logged so we can tell whether hardware ray tracing (e.g. hardware Lumen via Engine.ini) is
+// actually running: UE 5.4's Lumen mostly traces inline from compute shaders, so the clearest
+// sign is acceleration structure builds; ray tracing pipelines and DispatchRays are counted too.
+
+std::atomic<uint32_t> g_rtPipelines{0}, g_asBuilds{0}, g_rayDispatches{0};
+
+bool OnBuildAccelerationStructure(command_list*, acceleration_structure_type, acceleration_structure_build_flags,
+                                  uint32_t, const acceleration_structure_build_input*, resource, uint64_t,
+                                  resource_view, resource_view, acceleration_structure_build_mode) {
+    if (g_asBuilds.fetch_add(1) == 0) Log("first acceleration structure build: hardware ray tracing is on");
+    return false;
+}
+
+bool OnDispatchRays(command_list*, resource, uint64_t, uint64_t, resource, uint64_t, uint64_t, uint64_t, resource,
+                    uint64_t, uint64_t, uint64_t, resource, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t) {
+    if (g_rayDispatches.fetch_add(1) == 0) Log("first DispatchRays");
+    return false;
+}
+
 // ---------------------------------------------------------------- the LUT shader
 
 bool OnCreatePipeline(device*, pipeline_layout layout, uint32_t count, const pipeline_subobject* subobjects) {
+    for (uint32_t i = 0; i < count; ++i) {
+        if (subobjects[i].type == pipeline_subobject_type::raygen_shader) {
+            if (g_rtPipelines.fetch_add(1) == 0) Log("first ray tracing pipeline created");
+            return false;
+        }
+    }
     for (uint32_t i = 0; i < count; ++i) {
         if (subobjects[i].type != pipeline_subobject_type::compute_shader || !subobjects[i].data) continue;
         auto* sd = const_cast<shader_desc*>(static_cast<const shader_desc*>(subobjects[i].data));
@@ -362,6 +391,106 @@ bool OnDispatch(command_list* cmd, uint32_t, uint32_t, uint32_t) {
 
 // ---------------------------------------------------------------- present and overlay
 
+// ---------------------------------------------------------------- Engine.ini presets
+//
+// The overlay's lighting quality picker writes one of config\Engine.*.ini (embedded at build) to
+// the user Engine.ini and makes it read-only, since the game deletes it on exit otherwise. The
+// engine reads it at start-up, so a change applies after a restart. Every preset carries the two
+// LUT lines the HDR fix needs. A user's own Engine.ini (no preset marker) is only replaced on
+// request, and backed up first.
+
+struct Preset {
+    const char* id;
+    const char* label;
+    const char* text;
+};
+const Preset kPresets[] = {
+    {"base", "Game menu (no change)", kPreset_base},
+    {"epicplus", "Epic-plus (recommended, about 16% slower)", kPreset_epicplus},
+    {"cine", "Cinematic (about 60% slower)", kPreset_cine},
+};
+constexpr char kMarker[] = "; StillWakesTweaks preset: ";
+
+std::wstring g_engineIni;          // full path
+std::string g_presetAtLoad;        // what the engine read this session ("" = not ours, "-" = none)
+std::string g_presetNow;           // what the file holds now
+std::string g_iniMessage;
+
+std::wstring EngineIniPath() {
+    wchar_t local[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (!n || n >= MAX_PATH) return {};
+    return std::wstring(local) + L"\\Habitat\\Saved\\Config\\Windows\\Engine.ini";
+}
+
+// The preset id in the file, "" if the file isn't one of ours, "-" if there is no file.
+std::string ReadPresetId() {
+    FILE* f = _wfopen(g_engineIni.c_str(), L"rb");
+    if (!f) return "-";
+    char line[256] = {};
+    if (!fgets(line, sizeof(line), f)) line[0] = 0;
+    fclose(f);
+    if (strncmp(line, kMarker, sizeof(kMarker) - 1)) return "";
+    std::string id = line + sizeof(kMarker) - 1;
+    while (!id.empty() && (id.back() == '\n' || id.back() == '\r' || id.back() == ' ')) id.pop_back();
+    return id;
+}
+
+bool WritePreset(const Preset& p) {
+    if (g_engineIni.empty()) return false;
+    DWORD attrs = GetFileAttributesW(g_engineIni.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        if (ReadPresetId().empty()) {  // the user's own file: keep a copy
+            std::wstring backup = g_engineIni + L".before-StillWakesTweaks";
+            if (GetFileAttributesW(backup.c_str()) == INVALID_FILE_ATTRIBUTES)
+                CopyFileW(g_engineIni.c_str(), backup.c_str(), TRUE);
+        }
+        SetFileAttributesW(g_engineIni.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+    } else {
+        std::wstring dir = g_engineIni.substr(0, g_engineIni.find_last_of(L'\\'));
+        CreateDirectoryW(dir.c_str(), nullptr);  // Saved\Config\Windows exists after one game run
+    }
+    FILE* f = _wfopen(g_engineIni.c_str(), L"w");  // text mode: \n -> \r\n
+    bool ok = f && fputs(p.text, f) >= 0;
+    if (f) ok = fclose(f) == 0 && ok;
+    SetFileAttributesW(g_engineIni.c_str(), FILE_ATTRIBUTE_READONLY);
+    Log("Engine.ini preset %s %s", p.id, ok ? "written" : "COULD NOT be written");
+    if (ok) g_presetNow = p.id;
+    return ok;
+}
+
+void InitEngineIni() {
+    g_engineIni = EngineIniPath();
+    if (g_engineIni.empty()) return;
+    g_presetAtLoad = g_presetNow = ReadPresetId();
+    Log("Engine.ini: %s", g_presetAtLoad == "-" ? "none" : g_presetAtLoad.empty() ? "the user's own" : g_presetAtLoad.c_str());
+    // First run: put the HDR fix's LUT lines in place (takes effect at the next start).
+    if (g_presetAtLoad == "-" && WritePreset(kPresets[0]))
+        g_iniMessage = "Created Engine.ini for the HDR fix. Restart the game once so slider changes show instantly.";
+}
+
+void DrawPresetSection() {
+    ImGui::SeparatorText("Lighting quality");
+    int current = -1;
+    for (int i = 0; i < static_cast<int>(std::size(kPresets)); ++i)
+        if (g_presetNow == kPresets[i].id) current = i;
+    const char* preview = current >= 0 ? kPresets[current].label : g_presetNow.empty() ? "Your own Engine.ini" : "Not set";
+    if (ImGui::BeginCombo("Preset (applies after a restart)", preview)) {
+        for (int i = 0; i < static_cast<int>(std::size(kPresets)); ++i)
+            if (ImGui::Selectable(kPresets[i].label, i == current) && i != current) WritePreset(kPresets[i]);
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Global illumination, reflections, shadows and fog beyond the game's menu.\n"
+                          "Written to Engine.ini, which overrides the menu's lighting settings.");
+    if (g_presetNow.empty())
+        ImGui::TextWrapped("Your Engine.ini isn't one of ours. Choosing a preset replaces it; a copy is kept as "
+                           "Engine.ini.before-StillWakesTweaks.");
+    else if (g_presetNow != g_presetAtLoad)
+        ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "Restart the game to apply.");
+    if (!g_iniMessage.empty()) ImGui::TextWrapped("%s", g_iniMessage.c_str());
+}
+
 bool g_firstPresent = false;
 color_space g_lastColorSpace = color_space::unknown;
 
@@ -386,10 +515,21 @@ void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t
         Log("HDR fix %s (F8)", g_hdr.enable ? "on" : "off");
     }
     g_toggleKeyWasDown = down;
+
+    // Every 30 s, ray tracing activity so far (one line, only once there is some).
+    static ULONGLONG lastRtLog = GetTickCount64();
+    ULONGLONG now = GetTickCount64();
+    if (now - lastRtLog >= 30000) {
+        lastRtLog = now;
+        if (g_asBuilds.load() || g_rtPipelines.load() || g_rayDispatches.load())
+            Log("ray tracing so far: %u acceleration structure builds, %u RT pipelines, %u DispatchRays",
+                g_asBuilds.load(), g_rtPipelines.load(), g_rayDispatches.load());
+    }
 }
 
 void DrawOverlay(effect_runtime* rt) {
     if (!g_loaded) LoadSettings(rt);
+    ImGui::SeparatorText("HDR");
     bool changed = false;
     changed |= ImGui::Checkbox("HDR fix (F8 toggles in game)", &g_hdr.enable);
     changed |= ImGui::SliderFloat("Paper white (nits)", &g_hdr.paperWhite, 80.0f, 400.0f, "%.0f");
@@ -413,6 +553,8 @@ void DrawOverlay(effect_runtime* rt) {
                             g_layoutsExtended.load(), g_layoutsSeen.load(), g_pushes.load());
     else
         ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "LUT shader not replaced yet (see StillWakesTweaks.log)");
+
+    DrawPresetSection();
 }
 
 }  // namespace
@@ -423,6 +565,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             if (!reshade::register_addon(module)) return FALSE;
             g_loadTick = GetTickCount64();
             OpenLog();
+            InitEngineIni();
         {
             // ReShade.ini [StillWakesTweaks] Events: which event groups to listen for, for
             // finding what slows the game's start: 1 root signatures, 2 pipeline creation,
@@ -446,6 +589,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
                 reshade::register_event<reshade::addon_event::destroy_pipeline>(&OnDestroyPipeline);
             }
             if (events & 16) reshade::register_event<reshade::addon_event::bind_pipeline>(&OnBindPipeline);
+            reshade::register_event<reshade::addon_event::build_acceleration_structure>(&OnBuildAccelerationStructure);
+            reshade::register_event<reshade::addon_event::dispatch_rays>(&OnDispatchRays);
             if (events & (4 | 16)) {
                 reshade::register_event<reshade::addon_event::init_command_list>(&OnInitCommandList);
                 reshade::register_event<reshade::addon_event::destroy_command_list>(&OnDestroyCommandList);

@@ -28,6 +28,30 @@
 This build captures the back buffer at Present (F9 or the overlay button) and writes the
 `SWTDProbe\` reports next to the exe. See the header of `src/probe.cpp`.
 
+## No hardware ray tracing (2026-10-20)
+
+The game was cooked without ray-tracing shaders. With `r.RayTracing=1` and
+`r.Lumen.HardwareRayTracing=1` in the user Engine.ini (both `[SystemSettings]` and
+`[/Script/Engine.RendererSettings]`), start-up dies with `LowLevelFatalError ... Missing global
+shader FNiagaraCollisionRayTraceMiss's permutation 0, Please make sure cooking was successful`
+(ShaderCompiler.cpp:9368). The `r.RayTracing.*` / `r.Lumen.HardwareRayTracing*` cvars in the exe
+are just compiled-in engine code. Lumen stays software (distance fields / screen traces), so
+visual work has to go through software Lumen, shadow and fog settings.
+
+## Lighting quality beyond the menu (2026-10-20)
+
+The game's `DefaultScalability.ini` (pak; Oodle via UE's `oo2core_9_win64.dll`) leaves GI and
+shadow tiers at UE 5.4 defaults. It cuts reflections: `r.Lumen.Reflections.DownsampleFactor`
+is 4 on High and 2 on Epic, and full resolution only on Cine. `DefaultEngine.ini` also sets VSM
+page marking to a 2×2 stride and `ScreenProbeGather.Temporal.MaxFramesAccumulated=30`. The user
+was on High for GI, reflections and shadows. Presets are in `config/`. Galley test results:
+
+- **Cine tier**: 44 fps against 110.
+- **Epic-plus** (true Epic GI, shadows and fog; full-resolution reflections; probe budget
+  1000): 92 fps. Visibly more bounce light in shadows (the darkest 1% under the table goes
+  from 0.55 to 0.80 nits at the same median) and a sharper sheen on the table top and edge.
+  Colour and highlights are unchanged.
+
 ## Post-process passes (frame trace, 2026-10-19)
 
 The shipped DXIL keeps its reflection names, so `dxc -dumpbin` shows UE's parameter names.
