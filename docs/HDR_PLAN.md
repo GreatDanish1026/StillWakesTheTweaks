@@ -182,6 +182,50 @@ Use the same corridor and the HDR/SDR capture pair. Targets:
     to a few seconds, and F8 switches live.
   - ReShade reports UE's CBV and sampler tables as `push_descriptors_with_ranges_and_flags`
     (type 5), not as `descriptor_table`. Match on both.
+  - **Why blacks read ~20% above the SDR target (2026-10-20, simulation).** This is a
+    neutral-axis model of both 32-point LUTs with UE's default film curve:
+    `lutsim.py` logic, Slope 0.88 / Toe 0.55 / Shoulder 0.26, paper white 203. It isn't our
+    lift. The game's SDR LUT samples input on UE's log scale (LinToLog, floor at scene
+    ≈0.0027 → 0) and interpolates up from zero. That crushes shadows below its own curve:
+    −8% at scene 0.06, −19% at 0.03, −44% at 0.016, −75% at 0.008. Our PQ-sampled HDR LUT
+    stays within 1% of the curve down to 0.016. Below 0.008 it lifts (+25% to +90%), but
+    those values are under 0.02 nits. A 64-point LUT (`r.LUT.Size=64`) cuts that to ≤ 16%.
+    So "match SDR" now means matching SDR's quantisation crush, not its curve.
+  - **Galley (Christmas tree) capture, 2026-10-20, `r.LUT.Size=64`, peak 3700.** With
+    `UpdateEveryFrame`, the LUT is rebuilt once per present.
+
+    | | Fix on | Stock |
+    |---|---|---|
+    | median | 3.85 | 1.54 |
+    | 0.1% black | 0.245 | 0.106 |
+    | black ÷ median | 0.064 | 0.069 |
+    | max nits | 558 | 538 |
+    | highlight sat / R/Y | 0.58 / 1.31 | 0.70 / 1.46 |
+
+    - Not a peak test: the brightest source (the fluorescent tube) is ~550 nits either way.
+      The peak still needs an exterior or fire/flare scene.
+    - Trade-off: small coloured light bulbs come out paler with the fix. They take SDR's
+      chroma, and SDR's shoulder rolls them toward white. "Highlight saturation" (default 0)
+      brings untonemapped chroma back. Consider a non-zero default.
+  - **Highlight saturation default 0.5 (2026-10-20).** Same galley, ReShade 16-bit HDR10 PNG
+    screenshots (Print Screen), decoded with a C# PQ decoder. For the tree region above 100
+    nits:
+
+    | | 0.5 | Stock |
+    |---|---|---|
+    | saturation | 0.78 | 0.94 |
+    | R/Y | 0.81 | 1.15 |
+    | B/Y | 0.60 | 0.40 |
+
+    The bulbs keep distinct colours (pink, yellow, cyan, green) instead of rolling to white.
+    Stock remains more saturated and warmer; part of that is the ACES red shift being
+    removed. Whole frame: median 3.5 vs 1.5 nits, max ~500 for both.
+  - **Default raised to 0.75 (2026-10-20).** At the tree, highlights above 100 nits: 0.75
+    gives saturation 0.79 / R/Y 0.85, against stock 0.93 / 1.21. That's barely more than
+    0.5's 0.78 / 0.81, though the framing differed. The untonemapped chroma is close to
+    exhausted. The remaining gap is ACES's own saturation and red push, which the fix
+    removes on purpose. Visually the bulbs are near-identical to stock; stock pinks are
+    slightly deeper.
   - Superseded: 0.1% black measured 0.037 nits. The target is about 0.0095, but the SDR
     reference was another session and view, so it needs a same-session HDR-on / HDR-off /
     SDR set.

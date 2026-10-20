@@ -680,7 +680,7 @@ struct HdrSettings {
     float paperWhite = 203.0f;
     float peak = 0.0f;  // 0: the game's menu value
     float blackFloor = 1.0f;
-    float highlightSat = 0.0f;
+    float highlightSat = 0.75f;  // as StillWakesTweaks
     float knee = 0.5f;
 };
 HdrSettings g_hdr;

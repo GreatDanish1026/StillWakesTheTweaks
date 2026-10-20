@@ -114,7 +114,10 @@ struct HdrSettings {
     float paperWhite = 203.0f;
     float peak = 0.0f;  // 0: the game's HDR brightness
     float blackFloor = 1.0f;
-    float highlightSat = 0.0f;
+    // Untonemapped chroma back in highlights: at 0, small coloured lights (bulbs, LEDs) roll
+    // toward white as they do in SDR (galley capture: saturation 0.58 vs stock 0.70); at 0.5 the
+    // tree bulbs were 0.78 vs stock 0.94.
+    float highlightSat = 0.75f;
     float knee = 0.5f;
 };
 HdrSettings g_hdr;
