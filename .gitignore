@@ -1,0 +1,10 @@
+# Build output (rebuild with build.ps1)
+bin/
+*.exe
+*.dll
+*.addon64
+
+# Captures and logs the add-on writes next to the game
+SWTDProbe/
+*.log
+__pycache__/

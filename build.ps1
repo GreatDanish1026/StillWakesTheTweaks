@@ -1,0 +1,58 @@
+﻿# Builds the add-ons with MSVC (Visual Studio 2022+ with C++ tools):
+#   bin\StillWakesTweaks.addon64  the HDR fix (src\hdr.cpp)
+#   bin\SWTDProbe.addon64         the research probe: captures, frame trace, and the HDR fix
+#                                 with diagnostics (src\probe.cpp)
+# MSVC is required: ReShade is built with it, and MinGW returns API structs
+# differently, which crashes inside ReShade.
+# Only one of them may be installed at a time: both replace the same shader.
+# Usage: .\build.ps1 [-Install] [-Probe] [-GameBin <folder of StillWakesTheDeep.exe>]
+#   -Install installs StillWakesTweaks (or SWTDProbe with -Probe) and disables the other.
+param(
+    [switch]$Install,
+    [switch]$Probe,
+    [string]$GameBin = "E:\SteamLibrary\steamapps\common\Still Wakes the Deep\Habitat\Binaries\Win64"
+)
+$ErrorActionPreference = 'Stop'
+$root = $PSScriptRoot
+$exe = "StillWakesTheDeep.exe"
+
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+# vcvars64.bat runs vswhere by name.
+$env:PATH = "$(Split-Path $vswhere);$env:PATH"
+$vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vs) { throw "Visual Studio with the C++ x64 tools not found." }
+$vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+
+# The embedded LUT shaders (needs the UE 5.4 headers; see build_shaders.ps1).
+& "$root\build_shaders.ps1"
+
+$obj = "$root\bin\obj"
+New-Item -ItemType Directory -Force $obj | Out-Null
+
+# ReShade add-on headers in third_party\reshade match ReShade 6.8.0.
+foreach ($a in @(@{ Name = "StillWakesTweaks"; Src = "hdr.cpp" }, @{ Name = "SWTDProbe"; Src = "probe.cpp" })) {
+    $addon = "$root\bin\$($a.Name).addon64"
+    $cmd = @(
+        "call `"$vcvars`" >nul",
+        ("cl /nologo /std:c++17 /O2 /EHsc /MT /W3 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX " +
+         "/I `"$root\third_party\imgui`" /I `"$root\third_party\reshade\include`" /I `"$root\bin\shaders`" " +
+         "/Fo`"$obj\\`" `"$root\src\$($a.Src)`" user32.lib " +
+         "/link /DLL /OUT:`"$addon`" /PDB:`"$obj\$($a.Name).pdb`" /DEBUG")
+    ) -join " && "
+    cmd /c $cmd
+    if ($LASTEXITCODE) { throw "$($a.Name) build failed" }
+    Write-Host "Built $addon"
+}
+
+if ($Install) {
+    if (-not (Test-Path "$GameBin\$exe")) { throw "$exe not found in $GameBin (pass -GameBin)" }
+    if (Get-Process ([IO.Path]::GetFileNameWithoutExtension($exe)) -ErrorAction SilentlyContinue) { throw "Close the game first." }
+    $on, $off = if ($Probe) { "SWTDProbe", "StillWakesTweaks" } else { "StillWakesTweaks", "SWTDProbe" }
+    Copy-Item "$root\bin\$on.addon64" $GameBin -Force
+    Remove-Item "$GameBin\$on.addon64.off" -ErrorAction SilentlyContinue
+    if (Test-Path "$GameBin\$off.addon64") {
+        Move-Item "$GameBin\$off.addon64" "$GameBin\$off.addon64.off" -Force
+        Write-Host "Disabled $off ($off.addon64.off)"
+    }
+    Write-Host "Installed $on to $GameBin"
+}
