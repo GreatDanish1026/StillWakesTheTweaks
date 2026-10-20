@@ -18,7 +18,9 @@
 //
 // The overlay's lighting quality presets (config\Engine.*.ini) apply live through the game's console
 // variables (cvars.hpp: console manager found by code scan, UE 5.4 vtable layout) and are also
-// written to the read-only user Engine.ini for the next start.
+// written to the read-only user Engine.ini for the next start, with the overlay's
+// extras (anisotropy, texture pool, fog detail, GI response, bloom, lens flares, vignette) on
+// top. A stutter monitor logs hitches and whether shader compiles caused them.
 //
 // It deliberately doesn't listen for descriptor binds (bind_descriptor_tables/push_descriptors):
 // with those registered, ReShade mirrors the game's descriptor heaps and start-up showed 20 s+
@@ -34,12 +36,14 @@
 #include <imgui.h>
 #include <reshade.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <iterator>
 #include <map>
 #include <mutex>
@@ -115,6 +119,38 @@ uint32_t Crc32c(const void* data, size_t size) {
     uint32_t c = static_cast<uint32_t>(crc);
     for (; size; --size, ++p) c = _mm_crc32_u8(c, *p);
     return ~c;
+}
+
+// ---------------------------------------------------------------- pipeline compile timing
+//
+// create_pipeline and init_pipeline bracket the driver's CreatePipelineState on the same thread,
+// so the time between them is the compile (or the driver's cache lookup). The stutter monitor
+// (OnPresent) uses it to tell shader-compile hitches from the rest.
+
+int64_t g_qpcFreq = 1;
+thread_local int64_t t_pipeStart = 0;
+std::atomic<uint32_t> g_framePipes{0};          // compiled since the last present
+std::atomic<int64_t> g_framePipeMaxUs{0};       // longest of those
+std::atomic<uint64_t> g_pipesTotal{0}, g_pipesSlow{0};  // since start; slow = 10 ms or more
+
+int64_t Qpc() {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+
+void PipelineStarted() { t_pipeStart = Qpc(); }
+
+void PipelineFinished() {
+    if (!t_pipeStart) return;
+    int64_t us = (Qpc() - t_pipeStart) * 1000000 / g_qpcFreq;
+    t_pipeStart = 0;
+    ++g_framePipes;
+    ++g_pipesTotal;
+    if (us >= 10000) ++g_pipesSlow;
+    int64_t prev = g_framePipeMaxUs.load();
+    while (us > prev && !g_framePipeMaxUs.compare_exchange_weak(prev, us)) {
+    }
 }
 
 // ---------------------------------------------------------------- settings
@@ -295,6 +331,7 @@ bool OnDispatchRays(command_list*, resource, uint64_t, uint64_t, resource, uint6
 // ---------------------------------------------------------------- the LUT shader
 
 bool OnCreatePipeline(device*, pipeline_layout layout, uint32_t count, const pipeline_subobject* subobjects) {
+    PipelineStarted();
     for (uint32_t i = 0; i < count; ++i) {
         if (subobjects[i].type == pipeline_subobject_type::raygen_shader) {
             if (g_rtPipelines.fetch_add(1) == 0) Log("first ray tracing pipeline created");
@@ -334,6 +371,7 @@ std::unordered_map<uint64_t, uint64_t> g_lutPipelines;
 
 void OnInitPipeline(device*, pipeline_layout layout, uint32_t count, const pipeline_subobject* subobjects,
                     pipeline pipe) {
+    PipelineFinished();
     bool ours = t_creatingLut;
     for (uint32_t i = 0; i < count && !ours; ++i)
         ours = subobjects[i].type == pipeline_subobject_type::compute_shader && subobjects[i].data &&
@@ -422,7 +460,148 @@ constexpr char kMarker[] = "; StillWakesTweaks preset: ";
 std::wstring g_engineIni;          // full path
 std::string g_presetAtLoad;        // what the engine read this session ("" = not ours, "-" = none)
 std::string g_presetNow;           // what the file holds now
+std::string g_startupText;         // the file the engine started with
 std::string g_iniMessage;
+
+const Preset* FindPreset(const std::string& id) {
+    for (const Preset& p : kPresets)
+        if (id == p.id) return &p;
+    return nullptr;
+}
+
+// Settings picked on their own in the overlay, on top of the lighting preset. Each is a combo
+// whose first option (id 0) leaves the game's or preset's values; the chosen id is kept in
+// ReShade.ini and the option's cvars are written into Engine.ini after the preset and applied
+// live. Game values quoted are the game's Epic tiers (UE BaseScalability plus the game's
+// DefaultScalability / DefaultEngine).
+struct ExtraOption {
+    const char* label;
+    int id;
+    std::vector<std::pair<const char*, const char*>> cvars;
+};
+struct Extra {
+    const char* section;  // overlay heading
+    const char* key;      // ReShade.ini
+    const char* label;
+    const char* tip;
+    std::vector<ExtraOption> options;
+    int value = 0;
+};
+
+std::vector<Extra> g_extras = {
+    {"Textures and fog", "Anisotropy", "Anisotropic filtering",
+     "Sharper floors and walls at shallow angles. Textures already loaded keep their\n"
+     "filtering until the game restarts.",
+     {{"Game (8x on Epic)", 0, {}}, {"16x", 16, {{"r.MaxAnisotropy", "16"}}}}},
+    {"Textures and fog", "TexturePoolMB", "Texture pool",
+     "Video memory for streamed textures. Too small a pool keeps reloading textures\n"
+     "(blurry surfaces, streaming hitches). The RTX 5080 has 16 GB.",
+     {{"Game (2 GB on Epic)", 0, {}},
+      {"4 GB", 4096, {{"r.Streaming.PoolSize", "4096"}}},
+      {"6 GB", 6144, {{"r.Streaming.PoolSize", "6144"}}}}},
+    {"Textures and fog", "FogCellPixels", "Volumetric fog detail",
+     "Size of the fog's light grid in screen pixels: smaller cells give crisper light\n"
+     "shafts and halos, less blocky shadowing in fog. 4 px is about 4x the fog cost.",
+     {{"Preset (8 px cells)", 0, {}},
+      {"Fine (6 px)", 6,
+       {{"r.VolumetricFog.GridPixelSize", "6"}, {"r.VolumetricFog.GridSizeZ", "128"},
+        {"r.VolumetricFog.HistoryMissSupersampleCount", "8"}}},
+      {"Finest (4 px, Cinematic)", 4,
+       {{"r.VolumetricFog.GridPixelSize", "4"}, {"r.VolumetricFog.GridSizeZ", "128"},
+        {"r.VolumetricFog.HistoryMissSupersampleCount", "16"}}}}},
+
+    {"Lighting", "GiFrames", "Lighting response",
+     "How many frames Lumen's global illumination averages. The game uses 30 (UE's default\n"
+     "is 10): smooth but slow, so bounce light smears behind swinging lamps and opening\n"
+     "doors. Fewer frames react faster with a little more noise.",
+     {{"Game (30 frames)", 0, {}},
+      {"Faster (16)", 16, {{"r.Lumen.ScreenProbeGather.Temporal.MaxFramesAccumulated", "16"}}},
+      {"UE default (10)", 10, {{"r.Lumen.ScreenProbeGather.Temporal.MaxFramesAccumulated", "10"}}}}},
+
+    // UE has no bloom strength cvar (intensity is a post-process volume setting), only its
+    // resolution and on/off.
+    {"Post-processing", "Bloom", "Bloom",
+     "Glow around bright lights. The game renders it at half resolution on Epic.",
+     {{"Game (half resolution)", 0, {}},
+      {"Full resolution", 1, {{"r.Bloom.ScreenPercentage", "100"}}},
+      {"Off", 2, {{"r.BloomQuality", "0"}}}}},
+    {"Post-processing", "LensFlares", "Lens flares", "Ghost reflections of bright lights across the screen.",
+     {{"Game", 0, {}}, {"Off", 1, {{"r.LensFlareQuality", "0"}}}}},
+    {"Post-processing", "Vignette", "Vignette",
+     "Darkened screen corners. Off drops the tonemapper to quality 1, which also removes\n"
+     "film grain (already an option in the game's menu).",
+     {{"Game", 0, {}}, {"Off", 1, {{"r.Tonemapper.Quality", "1"}}}}},
+};
+
+// The game's Epic values for the extras' cvars. Going back to "Game" live needs a value to
+// return to; when the engine started with an extra already in Engine.ini, the menu's value was
+// never seen, so these are used instead (on lower menu tiers a restart gives the exact value).
+const std::map<std::wstring, std::wstring> kGameValues = {
+    {L"r.MaxAnisotropy", L"8"},
+    {L"r.Streaming.PoolSize", L"2048"},
+    {L"r.VolumetricFog.GridPixelSize", L"8"},
+    {L"r.VolumetricFog.GridSizeZ", L"128"},
+    {L"r.VolumetricFog.HistoryMissSupersampleCount", L"4"},
+    {L"r.Shadow.Virtual.ResolutionLodBiasDirectional", L"-1.5"},
+    {L"r.Shadow.Virtual.ResolutionLodBiasDirectionalMoving", L"-1.5"},
+    {L"r.Shadow.Virtual.ResolutionLodBiasLocal", L"0"},
+    {L"r.Shadow.Virtual.ResolutionLodBiasLocalMoving", L"1"},
+    {L"r.Shadow.Virtual.MaxPhysicalPages", L"4096"},
+    {L"r.Nanite.MaxPixelsPerEdge", L"1"},
+    {L"r.StaticMeshLODDistanceScale", L"1"},
+    {L"r.ViewDistanceScale", L"1"},
+    {L"r.Lumen.ScreenProbeGather.Temporal.MaxFramesAccumulated", L"30"},
+    {L"r.Bloom.ScreenPercentage", L"50"},
+    {L"r.BloomQuality", L"5"},
+    {L"r.LensFlareQuality", L"2"},
+    {L"r.Tonemapper.Quality", L"5"},
+};
+
+const ExtraOption* Chosen(const Extra& e) {
+    for (const ExtraOption& o : e.options)
+        if (o.id == e.value) return &o;
+    return nullptr;
+}
+
+void LoadExtras() {
+    for (Extra& e : g_extras) {
+        reshade::get_config_value(nullptr, SWTK_PRODUCT, e.key, e.value);
+        if (!Chosen(e)) e.value = 0;
+    }
+}
+
+void SaveExtras() {
+    for (const Extra& e : g_extras) reshade::set_config_value(nullptr, SWTK_PRODUCT, e.key, e.value);
+}
+
+std::map<std::string, std::string> ExtraValues() {
+    std::map<std::string, std::string> m;
+    for (const Extra& e : g_extras)
+        if (const ExtraOption* o = Chosen(e))
+            for (auto& [key, value] : o->cvars) m[key] = value;
+    return m;
+}
+
+// The preset with the extras on top: the preset's lines for those keys dropped, the extras
+// appended in their own [SystemSettings] block.
+std::string ComposeIni(const Preset& p) {
+    std::map<std::string, std::string> extras = ExtraValues();
+    std::string out;
+    for (const char* s = p.text; *s;) {
+        const char* e = strchr(s, '\n');
+        std::string line(s, e ? e - s + 1 : strlen(s));
+        s += line.size();
+        size_t eq = line.find('=');
+        if (eq != std::string::npos && line[0] != ';' && extras.count(line.substr(0, eq))) continue;
+        out += line;
+    }
+    if (!extras.empty()) {
+        if (!out.empty() && out.back() != '\n') out += '\n';
+        out += "\n; Extras from the overlay (textures and fog)\n[SystemSettings]\n";
+        for (auto& [key, value] : extras) out += key + "=" + value + "\n";
+    }
+    return out;
+}
 
 std::wstring EngineIniPath() {
     wchar_t local[MAX_PATH];
@@ -459,7 +638,7 @@ bool WritePreset(const Preset& p) {
         CreateDirectoryW(dir.c_str(), nullptr);  // Saved\Config\Windows exists after one game run
     }
     FILE* f = _wfopen(g_engineIni.c_str(), L"w");  // text mode: \n -> \r\n
-    bool ok = f && fputs(p.text, f) >= 0;
+    bool ok = f && fputs(ComposeIni(p).c_str(), f) >= 0;
     if (f) ok = fclose(f) == 0 && ok;
     SetFileAttributesW(g_engineIni.c_str(), FILE_ATTRIBUTE_READONLY);
     Log("Engine.ini preset %s %s", p.id, ok ? "written" : "COULD NOT be written");
@@ -471,8 +650,20 @@ void InitEngineIni() {
     g_engineIni = EngineIniPath();
     if (g_engineIni.empty()) return;
     g_presetAtLoad = g_presetNow = ReadPresetId();
+    if (FILE* f = _wfopen(g_engineIni.c_str(), L"rb")) {
+        char buf[4096];
+        for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0;) g_startupText.append(buf, n);
+        fclose(f);
+    }
     Log("Engine.ini: %s", g_presetAtLoad == "-" ? "none" : g_presetAtLoad.empty() ? "the user's own" : g_presetAtLoad.c_str());
     // First run: put the HDR fix's LUT lines in place (takes effect at the next start).
+    // Keep an Engine.ini of ours in step with the extras (e.g. after an option was removed or
+    // ReShade.ini changed); the engine has already read it, so this applies at the next start.
+    if (const Preset* p = FindPreset(g_presetAtLoad)) {
+        std::string want = ComposeIni(*p), have = g_startupText;
+        have.erase(std::remove(have.begin(), have.end(), ''), have.end());
+        if (want != have) WritePreset(*p);
+    }
     if (g_presetAtLoad == "-" && WritePreset(kPresets[0]))
         g_iniMessage = "Created Engine.ini for the HDR fix. Restart the game once so slider changes show instantly.";
 }
@@ -487,6 +678,9 @@ void InitEngineIni() {
 enum class Live { Idle, Searching, Ready, Failed };
 std::atomic<Live> g_live{Live::Idle};
 void* g_manager = nullptr;
+int g_sinkFlag = -1;          // offset of bCallAllConsoleVariableSinks in the manager
+ULONGLONG g_sinkRequested = 0;  // when we last set it (0 = not waiting)
+bool g_sinkConfirmed = false;
 std::string g_liveMessage;
 std::map<std::wstring, std::wstring> g_originals;  // menu value before we first changed it
 std::set<std::wstring> g_startupKeys;               // in the Engine.ini the engine started with
@@ -513,12 +707,6 @@ std::map<std::wstring, std::wstring> ParsePreset(const char* text) {
     return out;
 }
 
-const Preset* FindPreset(const std::string& id) {
-    for (const Preset& p : kPresets)
-        if (id == p.id) return &p;
-    return nullptr;
-}
-
 void FindManager() {
     const uint8_t* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
     int votes = 0, matches = 0;
@@ -535,13 +723,40 @@ void FindManager() {
         g_live = Live::Failed;
         return;
     }
+    g_sinkFlag = cvars::FindSinkFlagOffset(manager);
+    Log("console variable sinks flag at +0x%x (now %d)", g_sinkFlag, cvars::ReadSinkFlag(manager, g_sinkFlag));
     g_manager = manager;
     g_live = Live::Ready;
 }
 
-// Applies <to> live: its values in force, and settings it drops back to the menu's values.
+// After live sets: has the game thread run the sinks (which refresh cached settings such as
+// view distance and LOD scale). The game thread clearing the flag confirms the offset; if it
+// never does, the offset is wrong and we stop writing it.
+void RequestSinks() {
+    if (g_sinkFlag < 0) return;
+    if (cvars::RequestSinks(g_manager, g_sinkFlag)) g_sinkRequested = GetTickCount64();
+}
+
+void CheckSinks() {
+    if (!g_sinkRequested) return;
+    int v = cvars::ReadSinkFlag(g_manager, g_sinkFlag);
+    if (v == 0) {
+        if (!g_sinkConfirmed) Log("console variable sinks ran on the game thread");
+        g_sinkConfirmed = true;
+        g_sinkRequested = 0;
+    } else if (GetTickCount64() - g_sinkRequested > 3000) {
+        Log("console variable sinks flag (+0x%x) not cleared (%d): not using it", g_sinkFlag, v);
+        g_sinkFlag = -1;
+        g_sinkRequested = 0;
+    }
+}
+
+// Applies <to> (with the extras) live: its values in force, and settings it drops back to the
+// menu's values.
 void ApplyLive(const Preset& to) {
     std::map<std::wstring, std::wstring> want = ParsePreset(to.text);
+    for (auto& [key, value] : ExtraValues())
+        want[std::wstring(key.begin(), key.end())] = std::wstring(value.begin(), value.end());
     int set = 0, missing = 0, restored = 0, needRestart = 0;
     for (auto& [key, value] : want) {
         void* var = cvars::FindVariable(g_manager, key.c_str());
@@ -561,11 +776,17 @@ void ApplyLive(const Preset& to) {
     for (const std::wstring& key : dropped) {
         if (want.count(key)) continue;
         auto it = g_originals.find(key);
-        void* var = it != g_originals.end() ? cvars::FindVariable(g_manager, key.c_str()) : nullptr;
-        if (var && cvars::Set(var, it->second.c_str())) ++restored;
+        const std::wstring* back = it != g_originals.end() ? &it->second : nullptr;
+        if (!back) {
+            auto known = kGameValues.find(key);
+            if (known != kGameValues.end()) back = &known->second;
+        }
+        void* var = back ? cvars::FindVariable(g_manager, key.c_str()) : nullptr;
+        if (var && cvars::Set(var, back->c_str())) ++restored;
         else ++needRestart;
     }
     g_applied = std::move(want);
+    RequestSinks();
     char buf[200];
     snprintf(buf, sizeof(buf), "Applied live: %d settings%s", set + restored,
              needRestart ? "; some return to the menu's values only after a restart" : ".");
@@ -591,7 +812,10 @@ void KeepLiveValues() {
                                                : _wtoi(cur) == _wtoi(value.c_str());
         if (!same && cvars::Set(var, value.c_str())) ++fixed;
     }
-    if (fixed) Log("live: re-applied %d settings the game had changed", fixed);
+    if (fixed) {
+        Log("live: re-applied %d settings the game had changed", fixed);
+        RequestSinks();
+    }
 }
 
 // From present: start the search once, then apply what's pending and keep values in force.
@@ -606,15 +830,14 @@ void LiveOnPresent() {
     static bool first = true;
     if (first) {
         first = false;
-        const Preset* start = FindPreset(g_presetAtLoad);
-        if (start)
-            for (auto& [key, value] : ParsePreset(start->text)) g_startupKeys.insert(key);
+        for (auto& [key, value] : ParsePreset(g_startupText.c_str())) g_startupKeys.insert(key);
         if (!g_pendingLive) g_pendingLive = FindPreset(g_presetNow);
     }
     if (g_pendingLive) {
         ApplyLive(*g_pendingLive);
         g_pendingLive = nullptr;
     }
+    CheckSinks();
     KeepLiveValues();
 }
 
@@ -646,6 +869,120 @@ void DrawPresetSection() {
         ImGui::TextDisabled("Live changes unavailable (see StillWakesTweaks.log); presets apply after a restart.");
 }
 
+// The extras, one combo each under their section headings.
+void DrawExtrasSection() {
+    bool changed = false;
+    const char* section = nullptr;
+    for (Extra& e : g_extras) {
+        if (!section || strcmp(section, e.section)) ImGui::SeparatorText(section = e.section);
+        const ExtraOption* cur = Chosen(e);
+        if (ImGui::BeginCombo(e.label, cur ? cur->label : "?")) {
+            for (const ExtraOption& o : e.options)
+                if (ImGui::Selectable(o.label, o.id == e.value) && o.id != e.value) {
+                    e.value = o.id;
+                    changed = true;
+                    Log("extra %s: %s", e.key, o.label);
+                }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.tip);
+    }
+    if (!changed) return;
+    SaveExtras();
+    const Preset* p = FindPreset(g_presetNow);
+    if (!p) p = &kPresets[0];  // the user's own Engine.ini: replaced (backed up) by the base preset
+    if (WritePreset(*p)) g_pendingLive = p;
+}
+
+// ---------------------------------------------------------------- stutter monitor
+//
+// A frame counts as a hitch when it takes 2.5x the typical (median) frame time and at least
+// 25 ms. A hitch is put down to shader compiles when a pipeline compile of 10 ms or more (and
+// at least a third of the extra time) finished in it; the rest are texture or level
+// streaming, garbage collection or the like, which ReShade can't see. Only frames while the
+// game has focus count. Each hitch and a summary per minute go to the log.
+
+struct HitchStats {
+    uint64_t frames = 0, hitches = 0, severe = 0, shader = 0;
+    double worstMs = 0;
+};
+HitchStats g_sinceReset, g_minute;
+double g_medianMs = 0, g_p99Ms = 0;
+uint32_t g_hitchLines = 0;
+
+void MonitorOnPresent(bool focused) {
+    static int64_t last = 0;
+    static std::vector<float> ring(600);
+    static size_t ringPos = 0, ringCount = 0;
+    static ULONGLONG minuteStart = GetTickCount64();
+    static uint64_t pipesAtMinute = 0, slowAtMinute = 0;
+    int64_t now = Qpc();
+    uint32_t pipes = g_framePipes.exchange(0);
+    double longestMs = g_framePipeMaxUs.exchange(0) / 1000.0;
+    if (!last || !focused) {
+        last = now;
+        return;
+    }
+    double ms = (now - last) * 1000.0 / g_qpcFreq;
+    last = now;
+
+    if (ringCount >= 120) {
+        bool hitch = ms >= 2.5 * g_medianMs && ms >= 25.0;
+        if (hitch) {
+            bool shader = longestMs >= 10.0 && longestMs >= (ms - g_medianMs) / 3;
+            for (HitchStats* s : {&g_sinceReset, &g_minute}) {
+                ++s->hitches;
+                s->severe += ms >= 100.0;
+                s->shader += shader;
+            }
+            if (g_hitchLines++ < 3000)
+                Log("hitch %.1f ms (typical %.1f): %u pipelines compiled, longest %.1f ms -> %s", ms, g_medianMs, pipes,
+                    longestMs, shader ? "shader compile" : "other (streaming, GC...)");
+        }
+    }
+    for (HitchStats* s : {&g_sinceReset, &g_minute}) {
+        ++s->frames;
+        if (ms > s->worstMs) s->worstMs = ms;
+    }
+    ring[ringPos] = static_cast<float>(ms);
+    ringPos = (ringPos + 1) % ring.size();
+    if (ringCount < ring.size()) ++ringCount;
+    if (ringCount >= 120 && ringPos % 30 == 0) {
+        std::vector<float> sorted(ring.begin(), ring.begin() + ringCount);
+        std::sort(sorted.begin(), sorted.end());
+        g_medianMs = sorted[sorted.size() / 2];
+        g_p99Ms = sorted[sorted.size() * 99 / 100];
+    }
+
+    ULONGLONG tick = GetTickCount64();
+    if (tick - minuteStart >= 60000) {
+        uint64_t total = g_pipesTotal.load(), slow = g_pipesSlow.load();
+        Log("minute: %llu frames, typical %.1f ms, 99th %.1f ms, worst %.1f ms; %llu hitches (%llu over 100 ms, "
+            "%llu shader); %llu pipelines compiled (%llu slow)",
+            g_minute.frames, g_medianMs, g_p99Ms, g_minute.worstMs, g_minute.hitches, g_minute.severe,
+            g_minute.shader, total - pipesAtMinute, slow - slowAtMinute);
+        g_minute = {};
+        minuteStart = tick;
+        pipesAtMinute = total;
+        slowAtMinute = slow;
+    }
+}
+
+void DrawMonitorSection() {
+    ImGui::SeparatorText("Stutter monitor");
+    const HitchStats& s = g_sinceReset;
+    if (g_medianMs > 0)
+        ImGui::Text("Frame time: typical %.1f ms (%.0f fps), 99th percentile %.1f ms", g_medianMs, 1000.0 / g_medianMs,
+                    g_p99Ms);
+    ImGui::Text("Hitches: %llu (%llu over 100 ms), %llu from shader compiles; worst frame %.0f ms", s.hitches, s.severe,
+                s.shader, s.worstMs);
+    ImGui::TextDisabled("Pipelines compiled: %llu, %llu of them 10 ms or more", g_pipesTotal.load(), g_pipesSlow.load());
+    if (ImGui::Button("Reset counts")) {
+        g_sinceReset = {};
+        Log("stutter monitor reset");
+    }
+}
+
 bool g_firstPresent = false;
 color_space g_lastColorSpace = color_space::unknown;
 
@@ -664,7 +1001,9 @@ void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t
     HWND fg = GetForegroundWindow();
     DWORD pid = 0;
     GetWindowThreadProcessId(fg, &pid);
-    bool down = pid == GetCurrentProcessId() && (GetAsyncKeyState(kToggleHotkey) & 0x8000);
+    const bool focused = pid == GetCurrentProcessId();
+    MonitorOnPresent(focused);
+    bool down = focused && (GetAsyncKeyState(kToggleHotkey) & 0x8000);
     if (down && !g_toggleKeyWasDown) {
         g_hdr.enable = !g_hdr.enable;
         Log("HDR fix %s (F8)", g_hdr.enable ? "on" : "off");
@@ -712,6 +1051,8 @@ void DrawOverlay(effect_runtime* rt) {
         ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "LUT shader not replaced yet (see StillWakesTweaks.log)");
 
     DrawPresetSection();
+    DrawExtrasSection();
+    DrawMonitorSection();
 }
 
 }  // namespace
@@ -721,7 +1062,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         case DLL_PROCESS_ATTACH:
             if (!reshade::register_addon(module)) return FALSE;
             g_loadTick = GetTickCount64();
+            {
+                LARGE_INTEGER f;
+                QueryPerformanceFrequency(&f);
+                g_qpcFreq = f.QuadPart;
+            }
             OpenLog();
+            LoadExtras();
             InitEngineIni();
         {
             // ReShade.ini [StillWakesTweaks] Events: which event groups to listen for, for

@@ -133,3 +133,57 @@ gamma 2.2.
 - **The settings file changed with HDR.** With HDR off, GameUserSettings.ini had
   `HDRDisplayOutputNits=400`, `HDRUIDisplayOutputNits=50`. Turning HDR off may reset the
   sliders. Check them after turning HDR back on.
+
+## Textures, fog and stutter (2026-10-20, 0.0.3)
+
+Game config: no bundled PSO cache in the pak (only the global shader cache), so it relies on
+UE 5.4 PSO precaching (`r.PSOPrecaching=1`, `r.ShaderPipelineCache.Enabled=1`). GC clustering
+is off (`gc.ActorClusteringEnabled=False`). The Epic texture tier sets `r.Streaming.PoolSize=2048`
+(the game's own DefaultScalability) and `r.MaxAnisotropy=8` (UE base). Volumetric fog on Epic is
+UE's 8 px / 128 slices. The texture groups' `MipFilter="point"` is UE's default and doesn't
+matter on D3D12, where anisotropic filtering always blends mips.
+
+Overlay extras (live, also written into Engine.ini after the preset): anisotropy 16x, texture
+pool 4 / 6 GB, fog cells 6 / 4 px. In game: no frame rate change you can feel with 16x, 4 GB and
+4 px fog together (about 70 fps in that scene), and the 4 px fog looks good.
+
+Stutter monitor, first 6-minute session (typical frame 10-16 ms):
+- Shader compiles: clusters when entering new areas, with single compiles up to 867 ms
+  (minute 4: 628 pipelines compiled, 144 of them 10 ms or more). These are first-time compiles;
+  the driver cache (`%LOCALAPPDATA%\NVIDIA\DXCache`) should serve them on later runs.
+- Background precaching: about 7,000 pipelines in the first minute, nearly all under 5 ms.
+  They cause no hitches on their own.
+- 1.4-1.5 s freezes with no compile behind them (+264 s, +344 s), each followed by an 80-100 ms
+  frame. Each came 3-7 s after a ReShade Print Screen (11:09:30 -> 11:09:37, 11:10:54 ->
+  11:10:57), so they're most likely ReShade saving 16-bit 4K PNGs, not the game.
+
+## Bright-scene peak test (2026-10-20, fix on, peak 3700)
+
+- **Welding arc** (deck): luminance max 3382 nits, 99.9% 3352; channels up to 3685, so the
+  curve reaches the display peak. About 2,600 pixels of the arc core sit at the peak. The arc
+  keeps its cyan (highlight saturation 0.69) with a white core, and the sparks stay orange.
+- **Gas flare** (exterior, through fog): max 2499 nits, 99.9% 2364, with no flat clip. The flame
+  keeps its structure and stays orange-yellow (saturation 0.82). The BT.709 red channel reads
+  3976 because the flame is outside the 709 gamut; in BT.2020 it's within the peak clamp.
+- Conclusion: the peak is used, and bright sources roll off without washing out to white.
+
+## Detail settings that didn't help (2026-10-20)
+
+- **Distant detail** (`r.Nanite.MaxPixelsPerEdge` 0.5, `r.StaticMeshLODDistanceScale` 0.5,
+  `r.ViewDistanceScale` 2.5): no visible difference or frame-rate change at the flare-stack view,
+  even once it applied live. Removed. Those two scales are read from
+  `GetCachedScalabilityCVars()`, which only the scalability sink refreshes. SetOnly sets skip
+  sinks, so the add-on now sets `FConsoleManager::bCallAllConsoleVariableSinks` (+0x170 here,
+  read from `CallAllConsoleVariableSinks`, vtable +0x50: `cmp byte [rcx+off], 0`). The game
+  thread then runs the sinks and clears it, which the log confirms.
+- **Shadow sharpness** (VSM resolution bias down to -3.5 / -2, pages 16384): no visible change or
+  cost. The VSM already gives about one texel per screen pixel, and the soft edges come from
+  light size. Removed.
+- **Lighting response** (`r.Lumen.ScreenProbeGather.Temporal.MaxFramesAccumulated`, game 30):
+  applied, but only visible while lighting changes. Kept under "Lighting".
+- Going back to "Game" live needs the menu's value. When an extra was already in Engine.ini at
+  launch, that value was never seen, so the add-on now falls back to the game's Epic values.
+  An Engine.ini of ours is rewritten at load when it no longer matches the preset plus extras.
+
+Post-processing extras (bloom resolution/off, lens flares off, vignette off) work live, as
+expected: they're read on the game thread each frame.

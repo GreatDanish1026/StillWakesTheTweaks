@@ -6,5 +6,5 @@
 #define SWTD_GAME "Still Wakes the Deep"
 #define SWTD_VERSION_MAJOR 0
 #define SWTD_VERSION_MINOR 0
-#define SWTD_VERSION_PATCH 2
-#define SWTD_VERSION "0.0.2"
+#define SWTD_VERSION_PATCH 7
+#define SWTD_VERSION "0.0.7"

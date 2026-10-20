@@ -195,6 +195,58 @@ inline bool GetText(void* var, Type t, wchar_t* out, size_t n) {
     return false;
 }
 
+// Console variable sinks. SetOnly sets skip them, but some settings only reach the engine
+// through one: r.ViewDistanceScale and r.StaticMeshLODDistanceScale, for example, are read from
+// a copy (GetCachedScalabilityCVars) that only the scalability sink refreshes. The game thread
+// calls IConsoleManager::CallAllConsoleVariableSinks (vtable +0x50) every tick, and it runs the
+// sinks when FConsoleManager::bCallAllConsoleVariableSinks is set, then clears it. Setting that
+// flag from any thread is safe; the sinks then run on the game thread. Its offset is read from
+// the function's first instruction in a shipping build: cmp byte ptr [rcx+offset], 0.
+constexpr uint32_t kCallAllConsoleVariableSinks = 0x50;
+
+// The flag's offset in the manager, or -1.
+inline int FindSinkFlagOffset(void* manager) {
+    __try {
+        const uint8_t* fn = *reinterpret_cast<const uint8_t**>(*reinterpret_cast<uint8_t**>(manager) +
+                                                               kCallAllConsoleVariableSinks);
+        if (fn[0] == 0xe9) {  // jmp thunk
+            int32_t disp;
+            memcpy(&disp, fn + 1, 4);
+            fn += 5 + disp;
+        }
+        for (int i = 0; i < 32; ++i) {
+            const uint8_t* p = fn + i;
+            if (p[0] != 0x80) continue;
+            if ((p[1] == 0x79 || p[1] == 0x7b) && p[3] == 0) return p[2];  // cmp byte [rcx/rbx+disp8], 0
+            if ((p[1] == 0xb9 || p[1] == 0xbb) && p[6] == 0) {             // cmp byte [rcx/rbx+disp32], 0
+                int32_t disp;
+                memcpy(&disp, p + 2, 4);
+                return disp > 0 && disp < 0x1000 ? disp : -1;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return -1;
+}
+
+// The flag's value (0 or 1), or -1 if it doesn't look like a bool.
+inline int ReadSinkFlag(void* manager, int offset) {
+    uint8_t v = 0xff;
+    if (offset < 0 || !SafeCopy(&v, static_cast<uint8_t*>(manager) + offset, 1)) return -1;
+    return v <= 1 ? v : -1;
+}
+
+// Asks the game thread to run all sinks at its next tick.
+inline bool RequestSinks(void* manager, int offset) {
+    if (ReadSinkFlag(manager, offset) < 0) return false;
+    __try {
+        static_cast<volatile uint8_t*>(manager)[offset] = 1;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // Set from any thread (see the header). False if it faulted.
 inline bool Set(void* var, const wchar_t* value) {
     __try {
