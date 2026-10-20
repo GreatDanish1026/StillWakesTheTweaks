@@ -16,6 +16,10 @@
 //   - The LUT is rebuilt every frame only with r.LUT.UpdateEveryFrame=1 in a read-only user
 //     Engine.ini (the game deletes it otherwise).
 //
+// The overlay's lighting quality presets (config\Engine.*.ini) apply live through the game's console
+// variables (cvars.hpp: console manager found by code scan, UE 5.4 vtable layout) and are also
+// written to the read-only user Engine.ini for the next start.
+//
 // It deliberately doesn't listen for descriptor binds (bind_descriptor_tables/push_descriptors):
 // with those registered, ReShade mirrors the game's descriptor heaps and start-up showed 20 s+
 // of black screen. ReShade.ini [StillWakesTweaks] Events still allows them (bit 4) for testing.
@@ -37,7 +41,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <map>
 #include <mutex>
+#include <set>
+#include <thread>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -45,6 +52,7 @@
 #include <vector>
 
 #include "lutbuilder_skiptemp.h"
+#include "cvars.hpp"
 #include "presets.h"
 #include "version.h"
 
@@ -469,15 +477,158 @@ void InitEngineIni() {
         g_iniMessage = "Created Engine.ini for the HDR fix. Restart the game once so slider changes show instantly.";
 }
 
+// ---------------------------------------------------------------- live settings
+//
+// Presets also apply at once through the game's console variables (cvars.hpp), when the
+// console manager is found; Engine.ini still carries them into the next start. A setting the
+// engine took from the menu is restored to that value when a preset drops it; one that came
+// from the start-up preset can only return to the menu's value with a restart.
+
+enum class Live { Idle, Searching, Ready, Failed };
+std::atomic<Live> g_live{Live::Idle};
+void* g_manager = nullptr;
+std::string g_liveMessage;
+std::map<std::wstring, std::wstring> g_originals;  // menu value before we first changed it
+std::set<std::wstring> g_startupKeys;               // in the Engine.ini the engine started with
+std::map<std::wstring, std::wstring> g_applied;     // what we keep in force (the current preset)
+const Preset* g_pendingLive = nullptr;              // picked before the manager was found
+
+std::map<std::wstring, std::wstring> ParsePreset(const char* text) {
+    std::map<std::wstring, std::wstring> out;
+    bool system = false;
+    for (const char* p = text; *p;) {
+        const char* e = strchr(p, '\n');
+        std::string line(p, e ? e - p : strlen(p));
+        p = e ? e + 1 : p + line.size();
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line.empty() || line[0] == ';') continue;
+        if (line[0] == '[') {
+            system = line == "[SystemSettings]";
+            continue;
+        }
+        size_t eq = line.find('=');
+        if (!system || eq == std::string::npos) continue;
+        out[std::wstring(line.begin(), line.begin() + eq)] = std::wstring(line.begin() + eq + 1, line.end());
+    }
+    return out;
+}
+
+const Preset* FindPreset(const std::string& id) {
+    for (const Preset& p : kPresets)
+        if (id == p.id) return &p;
+    return nullptr;
+}
+
+void FindManager() {
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+    int votes = 0, matches = 0;
+    void** singleton = cvars::FindConsoleManagerSingleton(base, &votes, &matches);
+    void* manager = nullptr;
+    if (singleton) cvars::SafeCopy(&manager, singleton, 8);
+    void* probe = manager && cvars::HasModuleVtable(base, manager) ? cvars::FindVariable(manager, L"r.LUT.Size") : nullptr;
+    cvars::Type type = probe && cvars::HasModuleVtable(base, probe) ? cvars::GetType(probe) : cvars::Type::Unknown;
+    wchar_t value[32] = L"?";
+    if (type == cvars::Type::Int) cvars::GetText(probe, type, value, 32);
+    Log("console manager: singleton %p (%d of %d matches), manager %p, r.LUT.Size %p %s = %ls", singleton, votes,
+        matches, manager, probe, cvars::TypeName(type), value);
+    if (type != cvars::Type::Int) {
+        g_live = Live::Failed;
+        return;
+    }
+    g_manager = manager;
+    g_live = Live::Ready;
+}
+
+// Applies <to> live: its values in force, and settings it drops back to the menu's values.
+void ApplyLive(const Preset& to) {
+    std::map<std::wstring, std::wstring> want = ParsePreset(to.text);
+    int set = 0, missing = 0, restored = 0, needRestart = 0;
+    for (auto& [key, value] : want) {
+        void* var = cvars::FindVariable(g_manager, key.c_str());
+        if (!var) {
+            ++missing;
+            Log("live: %ls not found", key.c_str());
+            continue;
+        }
+        if (!g_originals.count(key) && !g_startupKeys.count(key)) {
+            wchar_t old[64];
+            if (cvars::GetText(var, cvars::GetType(var), old, 64)) g_originals[key] = old;
+        }
+        if (cvars::Set(var, value.c_str())) ++set;
+    }
+    std::set<std::wstring> dropped = g_startupKeys;
+    for (auto& [key, value] : g_applied) dropped.insert(key);
+    for (const std::wstring& key : dropped) {
+        if (want.count(key)) continue;
+        auto it = g_originals.find(key);
+        void* var = it != g_originals.end() ? cvars::FindVariable(g_manager, key.c_str()) : nullptr;
+        if (var && cvars::Set(var, it->second.c_str())) ++restored;
+        else ++needRestart;
+    }
+    g_applied = std::move(want);
+    char buf[200];
+    snprintf(buf, sizeof(buf), "Applied live: %d settings%s", set + restored,
+             needRestart ? "; some return to the menu's values only after a restart" : ".");
+    g_liveMessage = buf;
+    Log("live: preset %s: %d set, %d restored, %d not found, %d need a restart", to.id, set, restored, missing,
+        needRestart);
+}
+
+// Every 5 s: puts back any of our values the game changed (e.g. a menu change re-applying
+// scalability, which SetOnly sets can't outrank).
+void KeepLiveValues() {
+    static ULONGLONG last = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - last < 5000) return;
+    last = now;
+    int fixed = 0;
+    for (auto& [key, value] : g_applied) {
+        void* var = cvars::FindVariable(g_manager, key.c_str());
+        cvars::Type type = var ? cvars::GetType(var) : cvars::Type::Unknown;
+        wchar_t cur[64];
+        if (!var || !cvars::GetText(var, type, cur, 64)) continue;
+        bool same = type == cvars::Type::Float ? fabs(_wtof(cur) - _wtof(value.c_str())) < 1e-4
+                                               : _wtoi(cur) == _wtoi(value.c_str());
+        if (!same && cvars::Set(var, value.c_str())) ++fixed;
+    }
+    if (fixed) Log("live: re-applied %d settings the game had changed", fixed);
+}
+
+// From present: start the search once, then apply what's pending and keep values in force.
+void LiveOnPresent() {
+    Live state = g_live.load();
+    if (state == Live::Idle) {
+        g_live = Live::Searching;
+        std::thread(FindManager).detach();
+        return;
+    }
+    if (state != Live::Ready) return;
+    static bool first = true;
+    if (first) {
+        first = false;
+        const Preset* start = FindPreset(g_presetAtLoad);
+        if (start)
+            for (auto& [key, value] : ParsePreset(start->text)) g_startupKeys.insert(key);
+        if (!g_pendingLive) g_pendingLive = FindPreset(g_presetNow);
+    }
+    if (g_pendingLive) {
+        ApplyLive(*g_pendingLive);
+        g_pendingLive = nullptr;
+    }
+    KeepLiveValues();
+}
+
 void DrawPresetSection() {
     ImGui::SeparatorText("Lighting quality");
     int current = -1;
     for (int i = 0; i < static_cast<int>(std::size(kPresets)); ++i)
         if (g_presetNow == kPresets[i].id) current = i;
     const char* preview = current >= 0 ? kPresets[current].label : g_presetNow.empty() ? "Your own Engine.ini" : "Not set";
-    if (ImGui::BeginCombo("Preset (applies after a restart)", preview)) {
+    const bool live = g_live.load() == Live::Ready;
+    if (ImGui::BeginCombo(live ? "Preset" : "Preset (applies after a restart)", preview)) {
         for (int i = 0; i < static_cast<int>(std::size(kPresets)); ++i)
-            if (ImGui::Selectable(kPresets[i].label, i == current) && i != current) WritePreset(kPresets[i]);
+            if (ImGui::Selectable(kPresets[i].label, i == current) && i != current && WritePreset(kPresets[i]))
+                g_pendingLive = &kPresets[i];  // applied live by the next present, if possible
         ImGui::EndCombo();
     }
     if (ImGui::IsItemHovered())
@@ -486,9 +637,13 @@ void DrawPresetSection() {
     if (g_presetNow.empty())
         ImGui::TextWrapped("Your Engine.ini isn't one of ours. Choosing a preset replaces it; a copy is kept as "
                            "Engine.ini.before-StillWakesTweaks.");
-    else if (g_presetNow != g_presetAtLoad)
+    else if (live && !g_liveMessage.empty())
+        ImGui::TextDisabled("%s", g_liveMessage.c_str());
+    else if (!live && g_presetNow != g_presetAtLoad)
         ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "Restart the game to apply.");
-    if (!g_iniMessage.empty()) ImGui::TextWrapped("%s", g_iniMessage.c_str());
+    if (!live && !g_iniMessage.empty()) ImGui::TextWrapped("%s", g_iniMessage.c_str());
+    if (g_live.load() == Live::Failed)
+        ImGui::TextDisabled("Live changes unavailable (see StillWakesTweaks.log); presets apply after a restart.");
 }
 
 bool g_firstPresent = false;
@@ -515,6 +670,8 @@ void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t
         Log("HDR fix %s (F8)", g_hdr.enable ? "on" : "off");
     }
     g_toggleKeyWasDown = down;
+
+    LiveOnPresent();
 
     // Every 30 s, ray tracing activity so far (one line, only once there is some).
     static ULONGLONG lastRtLog = GetTickCount64();

@@ -52,6 +52,25 @@ was on High for GI, reflections and shadows. Presets are in `config/`. Galley te
   from 0.55 to 0.80 nits at the same median) and a sharper sheen on the table top and edge.
   Colour and highlights are unchanged.
 
+## Live console variables (2026-10-20)
+
+There's no PDB, so the console manager is found the way UntilDawnTweaks found it.
+`mov rcx, [rip+Singleton]` comes within 0x40 bytes before `lea rdx, [rip+L"r.ScreenPercentage"]`;
+14 of 16 matches agree. It's validated by the vtable lying in `.rdata` and `r.LUT.Size` reading
+as int 64. Vtable offsets come from UE 5.4's `IConsoleManager.h`. 5.4 added
+`IConsoleObject::GetParentObject` (+0x28), so the IsVariable* slots move by 8 from Until Dawn's,
+and `Set` is at +0x88 with an extra `FName Tag`. `FindConsoleVariable` stays at +0xb8.
+
+Values are set from ReShade's present thread with `ECVF_SetByCode | ECVF_Set_SetOnly_Unsafe`
+(0x0D020000). OnCVarChange then copies straight to the render-thread shadow, and OnChanged
+skips flags and delegates. A plain Set off the game thread would never reach the render thread.
+Because SetOnly doesn't record the priority, the add-on re-applies any value the game changes
+back, every 5 s.
+
+Confirmed in game: switching Epic-plus ↔ Cinematic changes the frame rate at once. Log:
+32 / 39 settings set, and the 7 Cinematic-only ones restored to their menu values on the way
+back.
+
 ## Post-process passes (frame trace, 2026-10-19)
 
 The shipped DXIL keeps its reflection names, so `dxc -dumpbin` shows UE's parameter names.
