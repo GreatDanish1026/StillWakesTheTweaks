@@ -9,7 +9,6 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $private = Join-Path $UE "Engine\Shaders\Private"
-if (-not (Test-Path "$private\TonemapCommon.ush")) { throw "UE shader headers not found in $private (pass -UE)" }
 
 $dxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\dxc.exe" | Sort-Object FullName | Select-Object -Last 1
 if (-not $dxc) { throw "dxc.exe not found (install the Windows SDK)" }
@@ -17,11 +16,19 @@ if (-not $dxc) { throw "dxc.exe not found (install the Windows SDK)" }
 $ue = "$root\bin\ue_shaders"
 $out = "$root\bin\shaders"
 New-Item -ItemType Directory -Force $ue, $out | Out-Null
-Copy-Item "$private\ACES.ush", "$private\GammaCorrectionCommon.ush" $ue -Force
-# TonemapCommon.ush declares InverseGamma and Film* as loose globals.
-(Get-Content "$private\TonemapCommon.ush") |
-    Where-Object { $_ -notmatch '^\s*(half3|float)\s+(InverseGamma|FilmSlope|FilmToe|FilmShoulder|FilmBlackClip|FilmWhiteClip)\s*;' } |
-    Set-Content "$ue\TonemapCommon.ush" -Encoding ascii
+$headers = "ACES.ush", "GammaCorrectionCommon.ush", "TonemapCommon.ush"
+if (Test-Path "$private\TonemapCommon.ush") {
+    Copy-Item "$private\ACES.ush", "$private\GammaCorrectionCommon.ush" $ue -Force
+    # TonemapCommon.ush declares InverseGamma and Film* as loose globals.
+    (Get-Content "$private\TonemapCommon.ush") |
+        Where-Object { $_ -notmatch '^\s*(half3|float)\s+(InverseGamma|FilmSlope|FilmToe|FilmShoulder|FilmBlackClip|FilmWhiteClip)\s*;' } |
+        Set-Content "$ue\TonemapCommon.ush" -Encoding ascii
+} elseif (-not ($headers | Where-Object { -not (Test-Path "$ue\$_") })) {
+    # No engine install: the copies from an earlier build are enough.
+    Write-Host "UE 5.4 shader headers not found in $private; using the cached headers in bin\ue_shaders"
+} else {
+    throw "UE shader headers not found in $private and no cached copies in bin\ue_shaders (pass -UE)"
+}
 
 # One variant per game permutation we replace.
 $variants = @(

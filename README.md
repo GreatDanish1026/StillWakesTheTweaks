@@ -5,7 +5,7 @@ the game's HDR output with one built from its SDR image, and puts graphics setti
 the game's menu in the ReShade overlay. Graphics changes apply at once, with no restart. See
 [docs/FINDINGS.md](docs/FINDINGS.md) for the measurements behind each choice.
 
-**Version 0.1.0.**
+**Version 1.0.0.**
 
 ## What it fixes
 
@@ -30,8 +30,10 @@ It still uses the full peak. In bright-scene tests a welding arc reached 3,382 n
 2. Copy `StillWakesTweaks.addon64` into that same folder.
 3. Start the game and turn on **HDR** in its display settings. Set **HDR Content Brightness**
    to your display's peak brightness.
-4. Restart the game once. On first run the add-on creates the user `Engine.ini` it needs
-   (below), and the engine only reads that file at start-up.
+4. Restart the game once. On first run the add-on sets up the recommended settings:
+   Epic-plus lighting, 4 px fog, 16x filtering and a 4 GB texture pool. They apply at once,
+   and are written to the user `Engine.ini` (below), which the engine only reads at start-up.
+   An existing `Engine.ini` is left alone.
 
 Open the ReShade overlay (Home): the settings are in its **StillWakesTweaks** tab.
 
@@ -117,7 +119,8 @@ Requirements:
 - The Windows SDK, for `dxc.exe`.
 - **Unreal Engine 5.4** installed locally. The LUT shader includes UE's `ACES.ush`,
   `GammaCorrectionCommon.ush` and `TonemapCommon.ush`. They're copied from the engine at build
-  time and not kept in this repo, since they're Epic's code.
+  time and not kept in this repo, since they're Epic's code. Once a build has copied them to
+  `bin\ue_shaders`, later builds use that copy if the engine is no longer installed.
 
 ```powershell
 .\build.ps1                     # builds bin\StillWakesTweaks.addon64 and bin\SWTDProbe.addon64

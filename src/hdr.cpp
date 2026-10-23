@@ -558,6 +558,10 @@ const std::map<std::wstring, std::wstring> kGameValues = {
     {L"r.Tonemapper.Quality", L"5"},
 };
 
+// The setup a new install starts with (option ids by ReShade.ini key, and the lighting preset).
+const std::map<std::string, int> kRecommended = {{"Anisotropy", 16}, {"TexturePoolMB", 4096}, {"FogCellPixels", 4}};
+constexpr char kRecommendedPreset[] = "epicplus";
+
 const ExtraOption* Chosen(const Extra& e) {
     for (const ExtraOption& o : e.options)
         if (o.id == e.value) return &o;
@@ -665,8 +669,20 @@ void InitEngineIni() {
         have.erase(std::remove(have.begin(), have.end(), '\r'), have.end());
         if (want != have) WritePreset(*p);
     }
-    if (g_presetAtLoad == "-" && WritePreset(kPresets[0]))
-        g_iniMessage = "Created Engine.ini for the HDR fix. Restart the game once so slider changes show instantly.";
+    // First run (no Engine.ini yet): the recommended setup. Existing setups are left as they are.
+    // It's applied live at the first present and read by the engine from the next start.
+    if (g_presetAtLoad == "-") {
+        for (Extra& e : g_extras) {
+            auto it = kRecommended.find(e.key);
+            if (it != kRecommended.end()) e.value = it->second;
+        }
+        SaveExtras();
+        if (const Preset* p = FindPreset(kRecommendedPreset); p && WritePreset(*p)) {
+            g_iniMessage = "First run: set up the recommended settings (Epic-plus lighting, 4 px fog, 16x "
+                           "filtering, 4 GB texture pool).";
+            Log("first run: recommended settings written");
+        }
+    }
 }
 
 // ---------------------------------------------------------------- live settings
@@ -947,7 +963,7 @@ void DrawGraphics() {
         ImGui::TextColored(kWarn, "Changes apply after a restart (see StillWakesTweaks.log).");
     else
         ImGui::TextDisabled("Connecting to the game's settings...");
-    if (live != Live::Ready && !g_iniMessage.empty()) ImGui::TextWrapped("%s", g_iniMessage.c_str());
+    if (!g_iniMessage.empty()) ImGui::TextWrapped("%s", g_iniMessage.c_str());
 
     if (!changed) return;
     SaveExtras();

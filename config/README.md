@@ -6,7 +6,8 @@ file on exit otherwise. A change applies at the next start. The build embeds thi
 the files here are the only copy. The first line (`; StillWakesTweaks preset: <id>`) is how the
 add-on recognises its own file. A user's own Engine.ini is only replaced on request, and is
 backed up as `Engine.ini.before-StillWakesTweaks`. On first run, with no Engine.ini, the add-on
-writes `base`. To install by hand, copy a file there and make it read-only.
+writes `epicplus` with the recommended overlay extras (4 px fog, 16x filtering, 4 GB texture
+pool). To install by hand, copy a file there and make it read-only.
 
 | File | What it does | Cost (RTX 5080, 4K, DLSS, galley) |
 |---|---|---|
